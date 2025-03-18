@@ -301,7 +301,7 @@ class WanVideoModelLoader:
                 "model": (folder_paths.get_filename_list("diffusion_models"), {"tooltip": "These models are loaded from the 'ComfyUI/models/diffusion_models' -folder",}),
 
             "base_precision": (["fp32", "bf16", "fp16", "fp16_fast"], {"default": "bf16"}),
-            "quantization": (['disabled', 'fp8_e4m3fn', 'fp8_e4m3fn_fast', 'fp8_e5m2', 'torchao_fp8dq', "torchao_fp8dqrow", "torchao_int8dq", "torchao_fp6", "torchao_int4", "torchao_int8"], {"default": 'disabled', "tooltip": "optional quantization method"}),
+            "quantization": (['disabled', 'fp8_e4m3fn', 'fp8_e4m3fn_fast', 'fp8_e5m2', 'fp8_scaled', 'torchao_fp8dq', "torchao_fp8dqrow", "torchao_int8dq", "torchao_fp6", "torchao_int4", "torchao_int8"], {"default": 'disabled', "tooltip": "optional quantization method."}),
             "load_device": (["main_device", "offload_device"], {"default": "main_device", "tooltip": "Initial device to load the model to, NOT recommended with the larger models unless you have 48GB+ VRAM"}),
             },
             "optional": {
@@ -427,13 +427,14 @@ class WanVideoModelLoader:
           
 
         if not "torchao" in quantization:
-            if quantization == "fp8_e4m3fn" or quantization == "fp8_e4m3fn_fast" or quantization == "fp8_scaled":
+            if quantization == "fp8_e4m3fn" or quantization == "fp8_e4m3fn_fast":
                 dtype = torch.float8_e4m3fn
             elif quantization == "fp8_e5m2":
                 dtype = torch.float8_e5m2
             else:
-                dtype = base_dtype
+                dtype = base_dtype  # fp8_scaled leaves some params full precision and expects fp16 or bf16, also upscasts during computation via a hook
             params_to_keep = {"norm", "head", "bias", "time_in", "vector_in", "patch_embedding", "time_", "img_emb", "modulation"}
+
             #if lora is not None:
             #    transformer_load_device = device
             if not lora_low_mem_load:
@@ -451,7 +452,7 @@ class WanVideoModelLoader:
             
             patcher = comfy.model_patcher.ModelPatcher(comfy_model, device, offload_device)
             patcher.model.is_patched = False
-            
+
             if lora is not None:
                 for l in lora:
                     log.info(f"Loading LoRA: {l['name']} with strength: {l['strength']}")
@@ -506,6 +507,13 @@ class WanVideoModelLoader:
                 #params_to_keep.update({"ffn"})
                 print(params_to_keep)
                 convert_fp8_linear(patcher.model.diffusion_model, base_dtype, params_to_keep=params_to_keep)
+            elif quantization == "fp8_scaled":
+                from .fp8_optimization import apply_fp8_monkey_patch, optimize_state_dict_with_fp8
+                state_dict = patcher.model.diffusion_model.state_dict()
+                exclude_layer_keys = ["norm", "patch_embedding", "text_embedding", "time_embedding", "time_projection", "head", "modulation", "img_emb", ]
+                state_dict = optimize_state_dict_with_fp8(state_dict, device, target_layer_keys=["blocks"], exclude_layer_keys=exclude_layer_keys)
+                apply_fp8_monkey_patch(patcher.model.diffusion_model, state_dict, False)  # It's modified in place so no need to assign, can pass true as third arg for fp8_fast/mm_scaled too but quality tanks
+                patcher.model.diffusion_model.load_state_dict(state_dict, strict=True, assign=True)
 
             if vram_management_args is not None:
                 from .diffsynth.vram_management import enable_vram_management, AutoWrappedModule, AutoWrappedLinear
