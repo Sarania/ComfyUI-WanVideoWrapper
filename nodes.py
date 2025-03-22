@@ -1,7 +1,8 @@
 import os
 import torch
+import torch.nn.functional as F
 import gc
-from .utils import log, print_memory, apply_lora
+from .utils import log, print_memory, apply_lora, clip_encode_image_tiled
 import numpy as np
 import math
 from tqdm import tqdm
@@ -1063,7 +1064,55 @@ class WanVideoImageClipEncode:
         }
 
         return (image_embeds,)
+
+class WanVideoImageResizeToClosest:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "image": ("IMAGE", {"tooltip": "Image to resize"}),
+            "generation_width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 8, "tooltip": "Width of the image to encode"}),
+            "generation_height": ("INT", {"default": 480, "min": 64, "max": 29048, "step": 8, "tooltip": "Height of the image to encode"}),
+            "aspect_ratio_preservation": (["keep_input", "stretch_to_new", "crop_to_new"],),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "INT", "INT", )
+    RETURN_NAMES = ("image","width","height",)
+    FUNCTION = "process"
+    CATEGORY = "WanVideoWrapper"
+    DESCRIPTION = "Resizes image to the closest supported resolution based on aspect ratio and max pixels, according to the original code"
+
+    def process(self, image, generation_width, generation_height, aspect_ratio_preservation ):
+
+        patch_size = (1, 2, 2)
+        vae_stride = (4, 8, 8)
     
+        H, W = image.shape[1], image.shape[2]
+        max_area = generation_width * generation_height
+
+        crop = "disabled"
+
+        if aspect_ratio_preservation == "keep_input":
+            aspect_ratio = H / W
+        elif aspect_ratio_preservation == "stretch_to_new" or aspect_ratio_preservation == "crop_to_new":
+            aspect_ratio = generation_height / generation_width
+            if aspect_ratio_preservation == "crop_to_new":
+                crop = "center"
+                
+        lat_h = round(
+        np.sqrt(max_area * aspect_ratio) // vae_stride[1] //
+        patch_size[1] * patch_size[1])
+        lat_w = round(
+            np.sqrt(max_area / aspect_ratio) // vae_stride[2] //
+            patch_size[2] * patch_size[2])
+        h = lat_h * vae_stride[1]
+        w = lat_w * vae_stride[2]
+
+        resized_image = common_upscale(image.movedim(-1, 1), w, h, "lanczos", crop).movedim(1, -1)
+
+        return (resized_image, w, h)
+    
+#region clip vision
 class WanVideoClipVisionEncode:
     @classmethod
     def INPUT_TYPES(s):
@@ -1073,11 +1122,13 @@ class WanVideoClipVisionEncode:
             "strength_1": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "Additional clip embed multiplier"}), 
             "strength_2": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "Additional clip embed multiplier"}),
             "crop": (["center", "disabled"], {"default": "center", "tooltip": "Crop image to 224x224 before encoding"}),
-            "combine_embeds": (["average", "sum"], {"default": "average", "tooltip": "Method to combine multiple clip embeds"}),
+            "combine_embeds": (["average", "sum", "concat"], {"default": "average", "tooltip": "Method to combine multiple clip embeds"}),
             "force_offload": ("BOOLEAN", {"default": True}),
             },
             "optional": {
                 "image_2": ("IMAGE", ),
+                "tiles": ("INT", {"default": 0, "min": 0, "max": 16, "step": 2, "tooltip": "Use matteo's tiled image encoding for improved accuracy"}),
+                "ratio": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Ratio of the tile average"}),
             }
         }
 
@@ -1086,26 +1137,32 @@ class WanVideoClipVisionEncode:
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
 
-    def process(self, clip_vision, image_1, strength_1, strength_2, force_offload, crop, combine_embeds, image_2=None):
+    def process(self, clip_vision, image_1, strength_1, strength_2, force_offload, crop, combine_embeds, image_2=None, tiles=0, ratio=1.0):
 
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
 
-        self.image_mean = [0.48145466, 0.4578275, 0.40821073]
-        self.image_std = [0.26862954, 0.26130258, 0.27577711]
-        
-        clip_vision.model.to(device)
+        image_mean = [0.48145466, 0.4578275, 0.40821073]
+        image_std = [0.26862954, 0.26130258, 0.27577711]
 
         if image_2 is not None:
             image = torch.cat([image_1, image_2], dim=0)
         else:
             image = image_1
 
-        if isinstance(clip_vision, ClipVisionModel):
-            clip_embeds = clip_vision.encode_image(image).last_hidden_state.to(device)
+        clip_vision.model.to(device)
+        image = image.to(device)
+
+        if tiles > 0:
+            log.info("Using tiled image encoding")
+            clip_embeds = clip_encode_image_tiled(clip_vision, image, tiles=tiles, ratio=ratio)
         else:
-            pixel_values = clip_preprocess(image.to(device), size=224, mean=self.image_mean, std=self.image_std, crop=(not crop == "disabled")).float()
-            clip_embeds = clip_vision.visual(pixel_values)
+            if isinstance(clip_vision, ClipVisionModel):
+                clip_embeds = clip_vision.encode_image(image).last_hidden_state.to(device)
+            else:
+                pixel_values = clip_preprocess(image.to(device), size=224, mean=image_mean, std=image_std, crop=(not crop == "disabled")).float()
+                clip_embeds = clip_vision.visual(pixel_values)
+        log.info(f"Clip embeds shape: {clip_embeds.shape}")
         
         if clip_embeds.shape[0] > 1:
             embed_1 = clip_embeds[0:1] * strength_1
@@ -1114,6 +1171,10 @@ class WanVideoClipVisionEncode:
                 clip_embeds = torch.mean(torch.stack([embed_1, embed_2]), dim=0)
             elif combine_embeds == "sum":
                 clip_embeds = torch.sum(torch.stack([embed_1, embed_2]), dim=0)
+            elif combine_embeds == "concat":
+                clip_embeds = torch.cat([embed_1, embed_2], dim=1)
+
+            log.info(f"Combined clip embeds shape: {clip_embeds.shape}")
         
         if force_offload:
             clip_vision.model.to(offload_device)
@@ -2415,7 +2476,8 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoControlEmbeds": WanVideoControlEmbeds,
     "WanVideoSLG": WanVideoSLG,
     "WanVideoTinyVAELoader": WanVideoTinyVAELoader,
-    "WanVideoLoopArgs": WanVideoLoopArgs
+    "WanVideoLoopArgs": WanVideoLoopArgs,
+    "WanVideoImageResizeToClosest": WanVideoImageResizeToClosest,
     }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoSampler": "WanVideo Sampler",
@@ -2445,5 +2507,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoControlEmbeds": "WanVideo Control Embeds",
     "WanVideoSLG": "WanVideo SLG",
     "WanVideoTinyVAELoader": "WanVideo Tiny VAE Loader",
-    "WanVideoLoopArgs": "WanVideo Loop Args"
+    "WanVideoLoopArgs": "WanVideo Loop Args",
+    "WanVideoImageResizeToClosest": "WanVideo Image Resize To Closest",
     }
