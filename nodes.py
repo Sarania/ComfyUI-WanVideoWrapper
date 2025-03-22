@@ -512,7 +512,7 @@ class WanVideoModelLoader:
             elif quantization == "fp8_scaled":
                 from .fp8_optimization import apply_fp8_monkey_patch, optimize_state_dict_with_fp8
                 state_dict = patcher.model.diffusion_model.state_dict()
-                exclude_layer_keys = ["norm", "patch_embedding", "text_embedding", "time_embedding", "time_projection", "head", "modulation", "img_emb", ]
+                exclude_layer_keys = ["norm", "patch_embedding", "bias", "text_embedding", "time_", "head", "modulation", "img_emb", "vector_in" ]
                 state_dict = optimize_state_dict_with_fp8(state_dict, device, target_layer_keys=["blocks"], exclude_layer_keys=exclude_layer_keys)
                 apply_fp8_monkey_patch(patcher.model.diffusion_model, state_dict, False)  # It's modified in place so no need to assign, can pass true as third arg for fp8_fast/mm_scaled too but quality tanks
                 patcher.model.diffusion_model.load_state_dict(state_dict, strict=True, assign=True)
