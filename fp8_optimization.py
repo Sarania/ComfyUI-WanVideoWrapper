@@ -64,7 +64,8 @@ def calculate_fp8_maxval(exp_bits=4, mantissa_bits=3, sign_bits=1):
         float: Maximum value representable in FP8 format
     """
     assert exp_bits + mantissa_bits + sign_bits == 8, "Total bits must be 8"
-
+    if exp_bits == 5:
+        return 57344
     # Calculate exponent bias
     bias = 2 ** (exp_bits - 1) - 1
 
@@ -127,10 +128,16 @@ def quantize_tensor_to_fp8(tensor, scale, exp_bits=4, mantissa_bits=3, sign_bits
 
 
 def optimize_state_dict_with_fp8(
-    state_dict, calc_device, target_layer_keys=None, exclude_layer_keys=None, exp_bits=4, mantissa_bits=3, move_to_device=False
+    state_dict,
+    calc_device,
+    target_layer_keys=None,
+    exclude_layer_keys=None,
+    exp_bits=4,
+    mantissa_bits=3,
+    move_to_device=False
 ):
     """
-    Optimize Linear layer weights in a model's state dict to FP8 format.
+    Optimize Linear layer weights in a model's state dict to FP8 format
 
     Args:
         state_dict (dict): State dict to optimize, replaced in-place
@@ -142,7 +149,7 @@ def optimize_state_dict_with_fp8(
         move_to_device (bool): Move optimized tensors to the calculating device
 
     Returns:
-        dict: FP8 optimized state dict
+        dict: FP8 optimized state dict with FP8 quantized weights and corresponding scale values
     """
     if exp_bits == 4 and mantissa_bits == 3:
         fp8_dtype = torch.float8_e4m3fn
@@ -155,13 +162,12 @@ def optimize_state_dict_with_fp8(
     max_value = calculate_fp8_maxval(exp_bits, mantissa_bits)
     min_value = -max_value  # this function supports only signed FP8
 
-    # Create optimized state dict
     optimized_count = 0
+    average_quantization_error = 0.0
 
-    # Enumerate tarket keys
+    # Find target keys for Linear layer weights
     target_state_dict_keys = []
     for key in state_dict.keys():
-        # Check if it's a weight key and matches target patterns
         is_target = (target_layer_keys is None or any(pattern in key for pattern in target_layer_keys)) and key.endswith(".weight")
         is_excluded = exclude_layer_keys is not None and any(pattern in key for pattern in exclude_layer_keys)
         is_target = is_target and not is_excluded
@@ -169,7 +175,7 @@ def optimize_state_dict_with_fp8(
         if is_target and isinstance(state_dict[key], torch.Tensor):
             target_state_dict_keys.append(key)
 
-    # Process each key
+    # Process each target weight tensor
     for key in tqdm(target_state_dict_keys):
         value = state_dict[key]
 
@@ -177,22 +183,27 @@ def optimize_state_dict_with_fp8(
         original_device = value.device
         original_dtype = value.dtype
 
-        # Move to calculation device
+        # Move to calculation device if provided
         if calc_device is not None:
             value = value.to(calc_device)
 
-        # Calculate scale factor
+        # Calculate scale factor based on the maximum absolute value in the tensor
         scale = torch.max(torch.abs(value.flatten())) / max_value
-        # print(f"Optimizing {key} with scale: {scale}")
 
-        # Quantize weight to FP8
+        # Quantize weight to FP8 format
         quantized_weight, _ = quantize_tensor_to_fp8(value, scale, exp_bits, mantissa_bits, 1, max_value, min_value)
 
-        # Add to state dict using original key for weight and new key for scale
-        fp8_key = key  # Maintain original key
+        # Otherwise, store the quantized weight and corresponding scale value.
+        fp8_key = key  # Use the original key for the quantized weight
         scale_key = key.replace(".weight", ".scale_weight")
 
         quantized_weight = quantized_weight.to(fp8_dtype)
+
+        # Reconstruct tensor by scaling back up
+        reconstructed = quantized_weight.to(original_dtype) * scale
+
+        # Calculate the mean relative error (in percent)
+        average_quantization_error += (torch.mean(torch.abs(value - reconstructed)) / (torch.mean(torch.abs(value)) + 1e-8)) * 100  # Adding a small epsilon to avoid division by zero issues if necessary.
 
         if not move_to_device:
             quantized_weight = quantized_weight.to(original_device)
@@ -204,11 +215,12 @@ def optimize_state_dict_with_fp8(
 
         optimized_count += 1
 
-        if calc_device is not None:  # optimized_count % 10 == 0 and
-            # free memory on calculation device
+        # Optionally free memory on the calculation device every 16 optimizations.
+        if calc_device is not None and optimized_count % 16 == 0:
             mm.soft_empty_cache()
-
-    logger.info(f"Number of optimized Linear layers: {optimized_count}")
+    average_quantization_error /= optimized_count
+    logging.info(f"Number of optimized Linear layers: {optimized_count}")
+    logging.info(f"Mean quantization error: {average_quantization_error:.2f}%")
     return state_dict
 
 
@@ -225,13 +237,14 @@ def fp8_linear_forward_patch(self: nn.Linear, x, use_scaled_mm=False, max_value=
     Returns:
         torch.Tensor: Result of linear transformation
     """
-    if use_scaled_mm:
+    if use_scaled_mm and x.ndim == 3:
         input_dtype = x.dtype
         original_weight_dtype = self.scale_weight.dtype
         weight_dtype = self.weight.dtype
-        target_dtype = torch.float8_e5m2
-        assert weight_dtype == torch.float8_e4m3fn, "Only FP8 E4M3FN format is supported"
-        assert x.ndim == 3, "Input tensor must be 3D (batch_size, seq_len, hidden_dim)"
+        assert weight_dtype in [torch.float8_e4m3fn, torch.float8_e5m2], "Only FP8 E4M3FN/E5M2 format is supported"
+        target_dtype = torch.float8_e5m2 if weight_dtype == torch.float8_e4m3fn else torch.float8_e4m3fn
+        e_bits = 5 if target_dtype == torch.float8_e5m2 else 4
+        m_bits = 2 if target_dtype == torch.float8_e5m2 else 3
 
         if max_value is None:
             # no input quantization
@@ -241,7 +254,7 @@ def fp8_linear_forward_patch(self: nn.Linear, x, use_scaled_mm=False, max_value=
             scale_x = (torch.max(torch.abs(x.flatten())) / max_value).to(torch.float32)
 
             # quantize input tensor to FP8: this seems to consume a lot of memory
-            x, _ = quantize_tensor_to_fp8(x, scale_x, 5, 2, 1, max_value, -max_value)
+            x, _ = quantize_tensor_to_fp8(x, scale_x, e_bits, m_bits, 1, max_value, -max_value)
 
         original_shape = x.shape
         x = x.reshape(-1, x.shape[2]).to(target_dtype)
@@ -255,7 +268,7 @@ def fp8_linear_forward_patch(self: nn.Linear, x, use_scaled_mm=False, max_value=
         else:
             o = torch._scaled_mm(x, weight, out_dtype=input_dtype, scale_a=scale_x, scale_b=scale_weight)
 
-        return o.reshape(original_shape[0], original_shape[1], -1).to(input_dtype)
+        return o.reshape(original_shape[0], original_shape[1], -1)
 
     else:
         # Dequantize the weight
@@ -271,7 +284,7 @@ def fp8_linear_forward_patch(self: nn.Linear, x, use_scaled_mm=False, max_value=
         return output
 
 
-def apply_fp8_monkey_patch(model, optimized_state_dict, use_scaled_mm=False):
+def apply_fp8_monkey_patch(model, optimized_state_dict, use_scaled_mm=False, scale_input_tensor=None):
     """
     Apply monkey patching to a model using FP8 optimized state dict.
 
@@ -283,9 +296,11 @@ def apply_fp8_monkey_patch(model, optimized_state_dict, use_scaled_mm=False):
     Returns:
         nn.Module: The patched model (same instance, modified in-place)
     """
-    # # Calculate FP8 float8_e5m2 max value
-    # max_value = calculate_fp8_maxval(5, 2)
-    max_value = None  # do not quantize input tensor
+    max_value = None
+    if use_scaled_mm:
+        setattr(model, "fp8_matmul_enabled", True)
+        if scale_input_tensor is not None:
+            max_value = calculate_fp8_maxval(4, 3) if "e4m3" in scale_input_tensor else calculate_fp8_maxval(5, 2) if "e5m2" in scale_input_tensor else None
 
     # Find all scale keys to identify FP8-optimized layers
     scale_keys = [k for k in optimized_state_dict.keys() if k.endswith(".scale_weight")]
@@ -318,5 +333,5 @@ def apply_fp8_monkey_patch(model, optimized_state_dict, use_scaled_mm=False):
 
             patched_count += 1
 
-    logger.info(f"Number of monkey-patched Linear layers: {patched_count}")
+    logging.info(f"Number of monkey-patched Linear layers: {patched_count}")
     return model
