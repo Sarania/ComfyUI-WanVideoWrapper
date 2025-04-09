@@ -180,7 +180,52 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, seq_lens, grid_sizes, freqs, seq_chunks=1,current_step=0, video_attention_split_steps = [], rope_func = "default"):
+    def forward(self, x, seq_lens, grid_sizes, freqs, rope_func = "default"):
+        r"""
+        Args:
+            x(Tensor): Shape [B, L, num_heads, C / num_heads]
+            seq_lens(Tensor): Shape [B]
+            grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
+            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+        """
+        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+
+        # query, key, value function
+        def qkv_fn(x):
+            q = self.norm_q(self.q(x)).view(b, s, n, d)
+            k = self.norm_k(self.k(x)).view(b, s, n, d)
+            v = self.v(x).view(b, s, n, d)
+            return q, k, v
+
+        q, k, v = qkv_fn(x)
+
+        if rope_func == "comfy":
+            q, k = apply_rope_comfy(q, k, freqs)
+        else:
+            q=rope_apply(q, grid_sizes, freqs)
+            k=rope_apply(k, grid_sizes, freqs)
+
+        if is_enhance_enabled():
+            feta_scores = get_feta_scores(q, k)
+
+        x = attention(
+            q=q,
+            k=k,
+            v=v,
+            k_lens=seq_lens,
+            window_size=self.window_size,
+            attention_mode=self.attention_mode)
+
+        # output
+        x = x.flatten(2)
+        x = self.o(x)
+
+        if is_enhance_enabled():
+            x *= feta_scores
+
+        return x
+    
+    def forward_split(self, x, seq_lens, grid_sizes, freqs, seq_chunks=1,current_step=0, video_attention_split_steps = [], rope_func = "default"):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -420,88 +465,96 @@ class WanAttentionBlock(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
-        assert e.dtype == torch.float32
-        e = (self.modulation.to(torch.float32).to(e.device) + e.to(torch.float32)).chunk(6, dim=1)
-        assert e[0].dtype == torch.float32
+        e = (self.modulation + e).chunk(6, dim=1)
 
         # self-attention
-        y = self.self_attn(
-            self.norm1(x).float() * (1 + e[1]) + e[0], 
+        if (context.shape[0] > 1 or (clip_embed is not None and clip_embed.shape[0] > 1)) and x.shape[0] == 1:
+             y = self.self_attn.forward_split(
+            self.norm1(x) * (1 + e[1]) + e[0], 
             seq_lens, grid_sizes,
             freqs, rope_func=rope_func, 
             seq_chunks=max(context.shape[0], clip_embed.shape[0] if clip_embed is not None else 0),
             current_step=current_step,
             video_attention_split_steps=video_attention_split_steps
             )
+        else:
+            y = self.self_attn.forward(
+            self.norm1(x) * (1 + e[1]) + e[0], 
+            seq_lens, grid_sizes,
+            freqs, rope_func=rope_func
+            )
         
         x = x.to(torch.float32) + (y.to(torch.float32) * e[2].to(torch.float32))
 
         # cross-attention & ffn function
-        def cross_attn_ffn(x, context, context_lens, e, clip_embed=None, grid_sizes=None):
-            if context.shape[0] > 1 or (clip_embed is not None and clip_embed.shape[0] > 1):
-                # Get number of prompts
-                num_prompts = context.shape[0]
-                num_clip_embeds = 0 if clip_embed is None else clip_embed.shape[0]
-                num_segments = max(num_prompts, num_clip_embeds)
-                
-                # Extract spatial dimensions
-                frames, height, width = grid_sizes[0]  # Assuming batch size 1
-                tokens_per_frame = height * width
-                
-                # Distribute frames across prompts
-                frames_per_segment = max(1, frames // num_segments)
-                
-                # Process each prompt segment
-                x_combined = torch.zeros_like(x)
-                
-                for i in range(num_segments):
-                    # Calculate frame boundaries for this segment
-                    start_frame = i * frames_per_segment
-                    end_frame = min((i+1) * frames_per_segment, frames) if i < num_segments-1 else frames
-                    
-                    # Convert frame indices to token indices
-                    start_idx = start_frame * tokens_per_frame
-                    end_idx = end_frame * tokens_per_frame
-                    segment_indices = torch.arange(start_idx, end_idx, device=x.device, dtype=torch.long)
-                    
-                    # Get prompt segment (cycle through available prompts if needed)
-                    prompt_idx = i % num_prompts
-                    segment_context = context[prompt_idx:prompt_idx+1]
-                    segment_context_lens = None
-                    if context_lens is not None:
-                        segment_context_lens = context_lens[prompt_idx:prompt_idx+1]
-                    
-                    # Handle clip_embed for this segment (cycle through available embeddings)
-                    segment_clip_embed = None
-                    if clip_embed is not None:
-                        clip_idx = i % num_clip_embeds
-                        segment_clip_embed = clip_embed[clip_idx:clip_idx+1]
-                    
-                    # Get tensor segment
-                    x_segment = x[:, segment_indices, :]
-                    
-                    # Process segment with its prompt and clip embedding
-                    processed_segment = self.cross_attn(self.norm3(x_segment), segment_context, segment_context_lens, clip_embed=segment_clip_embed)
-                    processed_segment = processed_segment.to(x.dtype)
-                    
-                    # Add to combined result
-                    x_combined[:, segment_indices, :] = processed_segment
-                
-                # Continue with FFN
-                x = x + x_combined
-                y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
-                x = x.to(torch.float32) + (y.to(torch.float32) * e[5].to(torch.float32))
-                return x
-                
-            else:
-                x = x + self.cross_attn(self.norm3(x), context, context_lens, clip_embed=clip_embed)
-                y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
-                x = x.to(torch.float32) + (y.to(torch.float32) * e[5].to(torch.float32))
-                return x
-
-        x = cross_attn_ffn(x, context, context_lens, e, clip_embed=clip_embed, grid_sizes=grid_sizes)
+        if (context.shape[0] > 1 or (clip_embed is not None and clip_embed.shape[0] > 1)) and x.shape[0] == 1:
+            x = self.split_cross_attn_ffn(x, context, context_lens, e, clip_embed=clip_embed, grid_sizes=grid_sizes)
+        else:
+            x = self.cross_attn_ffn(x, context, context_lens, e, clip_embed=clip_embed, grid_sizes=grid_sizes)
 
         return x
+    
+    def cross_attn_ffn(self, x, context, context_lens, e, clip_embed=None, grid_sizes=None):
+            x = x + self.cross_attn(self.norm3(x), context, context_lens, clip_embed=clip_embed)
+            y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
+            x = x.to(torch.float32) + (y.to(torch.float32) * e[5])
+            return x
+    
+    @torch.compiler.disable()
+    def split_cross_attn_ffn(self, x, context, context_lens, e, clip_embed=None, grid_sizes=None):
+        # Get number of prompts
+        num_prompts = context.shape[0]
+        num_clip_embeds = 0 if clip_embed is None else clip_embed.shape[0]
+        num_segments = max(num_prompts, num_clip_embeds)
+        
+        # Extract spatial dimensions
+        frames, height, width = grid_sizes[0]  # Assuming batch size 1
+        tokens_per_frame = height * width
+        
+        # Distribute frames across prompts
+        frames_per_segment = max(1, frames // num_segments)
+        
+        # Process each prompt segment
+        x_combined = torch.zeros_like(x)
+        
+        for i in range(num_segments):
+            # Calculate frame boundaries for this segment
+            start_frame = i * frames_per_segment
+            end_frame = min((i+1) * frames_per_segment, frames) if i < num_segments-1 else frames
+            
+            # Convert frame indices to token indices
+            start_idx = start_frame * tokens_per_frame
+            end_idx = end_frame * tokens_per_frame
+            segment_indices = torch.arange(start_idx, end_idx, device=x.device, dtype=torch.long)
+            
+            # Get prompt segment (cycle through available prompts if needed)
+            prompt_idx = i % num_prompts
+            segment_context = context[prompt_idx:prompt_idx+1]
+            segment_context_lens = None
+            if context_lens is not None:
+                segment_context_lens = context_lens[prompt_idx:prompt_idx+1]
+            
+            # Handle clip_embed for this segment (cycle through available embeddings)
+            segment_clip_embed = None
+            if clip_embed is not None:
+                clip_idx = i % num_clip_embeds
+                segment_clip_embed = clip_embed[clip_idx:clip_idx+1]
+            
+            # Get tensor segment
+            x_segment = x[:, segment_indices, :]
+            
+            # Process segment with its prompt and clip embedding
+            processed_segment = self.cross_attn(self.norm3(x_segment), segment_context, segment_context_lens, clip_embed=segment_clip_embed)
+            processed_segment = processed_segment.to(x.dtype)
+            
+            # Add to combined result
+            x_combined[:, segment_indices, :] = processed_segment
+        
+        # Continue with FFN
+        x = x + x_combined
+        y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
+        x = x.to(torch.float32) + (y.to(torch.float32) * e[5].to(torch.float32))
+        return x            
 
 class VaceWanAttentionBlock(WanAttentionBlock):
     def __init__(
@@ -526,18 +579,19 @@ class VaceWanAttentionBlock(WanAttentionBlock):
         nn.init.zeros_(self.after_proj.weight)
         nn.init.zeros_(self.after_proj.bias)
 
-    def forward(self, c, x, **kwargs):
+    def forward(self, c_list, x, intermediate_device=None, nonblocking=True, **kwargs):
         if self.block_id == 0:
-            c = self.before_proj(c) + x
+            c = self.before_proj(c_list[0]) + x
             all_c = []
         else:
-            all_c = list(torch.unbind(c))
+            all_c = c_list
             c = all_c.pop(-1)
         c = super().forward(c, **kwargs)
         c_skip = self.after_proj(c)
-        all_c += [c_skip, c]
-        c = torch.stack(all_c)
-        return c
+
+        all_c += [c_skip.to(intermediate_device, non_blocking=nonblocking), c]
+        
+        return all_c
 
 class BaseWanAttentionBlock(WanAttentionBlock):
     def __init__(
@@ -590,10 +644,9 @@ class Head(nn.Module):
             e(Tensor): Shape [B, C]
         """
         assert e.dtype == torch.float32
-        e_unsqueezed = e.unsqueeze(1).to(torch.float32)
-        e = (self.modulation.to(torch.float32).to(e.device) + e_unsqueezed).chunk(2, dim=1)
-        normed = self.norm(x).to(torch.float32)
-        x = self.head(normed * (1 + e[1].to(torch.float32)) + e[0].to(torch.float32))
+        e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
+        normed = self.norm(x)
+        x = self.head(normed * (1 + e[1]) + e[0])
         return x
 
 
@@ -818,7 +871,7 @@ class WanModel(ModelMixin, ConfigMixin):
                 block.to(self.offload_device, non_blocking=self.use_non_blocking)
                 total_offload_memory += block_memory
 
-        if blocks_to_swap > 0 and vace_blocks_to_swap == 0:
+        if blocks_to_swap != -1 and vace_blocks_to_swap == 0:
             vace_blocks_to_swap = 1
 
         if vace_blocks_to_swap > 0 and self.vace_layers is not None:
@@ -860,22 +913,23 @@ class WanModel(ModelMixin, ConfigMixin):
                       dim=1) for u in c
         ])
 
-        # arguments
-        new_kwargs = dict(x=x)
-        new_kwargs.update(kwargs)
-
+        if x.shape[1] != c.shape[1]:
+            c = c[:, :x.shape[1]]
+        
+        c_list = [c]
         for b, block in enumerate(self.vace_blocks):
             if b <= self.vace_blocks_to_swap and self.vace_blocks_to_swap >= 0:
                 block.to(self.main_device)
-            c = block(c, **new_kwargs)
+            c_list = block(
+                c_list, x, 
+                intermediate_device=self.offload_device if self.vace_blocks_to_swap != -1 else self.main_device, 
+                nonblocking=self.use_non_blocking,
+                **kwargs)
             if b <= self.vace_blocks_to_swap and self.vace_blocks_to_swap >= 0:
                 block.to(self.offload_device, non_blocking=self.use_non_blocking)
 
-        #for block in self.vace_blocks:
-        #    c = block(c, **new_kwargs)
-        hints = torch.unbind(c)[:-1]
-        if self.vace_blocks_to_swap != -1:
-            hints = [h.to(self.offload_device) for h in hints] 
+        hints = c_list[:-1]
+        
         return hints
 
     def forward(
@@ -1027,7 +1081,7 @@ class WanModel(ModelMixin, ConfigMixin):
 
             previous_modulated_input = e.clone() if (self.teacache_use_coefficients and self.teacache_mode == 'e') else e0.clone()
             if not should_calc:
-                x += previous_residual.to(x.device)
+                x = x.to(previous_residual.dtype) + previous_residual.to(x.device)
                 #log.info(f"TeaCache: Skipping uncond step {current_step+1}")
                 self.teacache_state.update(
                     pred_id,
@@ -1061,11 +1115,11 @@ class WanModel(ModelMixin, ConfigMixin):
                         if (data["start"] <= current_step_percentage <= data["end"]) or \
                             (data["end"] > 0 and current_step == 0 and current_step_percentage >= data["start"]):
 
-                            vace_hints = self.forward_vace(x, data["context"], seq_len, kwargs)
+                            vace_hints = self.forward_vace(x.to(torch.float32), data["context"], data["seq_len"], kwargs)
                             vace_hint_list.append(vace_hints)
                             vace_scale_list.append(data["scale"])
                 else:
-                    vace_hints = self.forward_vace(x, vace_data, seq_len, kwargs)
+                    vace_hints = self.forward_vace(x.to(torch.float32), vace_data, seq_len, kwargs)
                     vace_hint_list.append(vace_hints)
                     vace_scale_list.append(1.0)
                 
@@ -1079,7 +1133,7 @@ class WanModel(ModelMixin, ConfigMixin):
                             continue
                 if b <= self.blocks_to_swap and self.blocks_to_swap >= 0:
                     block.to(self.main_device)
-                x = block(x, **kwargs)
+                x = block(x.to(torch.float32), **kwargs)
                 if b <= self.blocks_to_swap and self.blocks_to_swap >= 0:
                     block.to(self.offload_device, non_blocking=self.use_non_blocking)
 
@@ -1090,7 +1144,6 @@ class WanModel(ModelMixin, ConfigMixin):
                     accumulated_rel_l1_distance=accumulated_rel_l1_distance.to(self.teacache_cache_device, non_blocking=self.use_non_blocking),
                     previous_modulated_input=previous_modulated_input.to(self.teacache_cache_device, non_blocking=self.use_non_blocking)
                 )
-
         x = self.head(x, e)
         x = self.unpatchify(x, grid_sizes) # type: ignore[arg-type]
         x = [u.float() for u in x]
@@ -1168,27 +1221,3 @@ def relative_l1_distance(last_tensor, current_tensor):
     norm = torch.abs(last_tensor).mean()
     relative_l1_distance = l1_distance / norm
     return relative_l1_distance.to(torch.float32).to(current_tensor.device)
-
-def normalize_values(values):
-    min_val = min(values)
-    max_val = max(values)
-    if max_val == min_val:
-        return [0.0] * len(values)
-    return [(x - min_val) / (max_val - min_val) for x in values]
-
-def rescale_differences(input_diffs, output_diffs):
-    """Polynomial fitting between input and output differences"""
-    poly_degree = 4
-    if len(input_diffs) < 2:
-        return input_diffs
-    
-    x = np.array([x.item() for x in input_diffs])
-    y = np.array([y.item() for y in output_diffs])
-    print("x ", x)
-    print("y ", y)
-    
-    # Fit polynomial
-    coeffs = np.polyfit(x, y, poly_degree)
-    
-    # Apply polynomial transformation
-    return np.polyval(coeffs, x)
